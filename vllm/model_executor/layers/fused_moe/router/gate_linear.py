@@ -4,6 +4,7 @@ import torch
 from torch.nn.parameter import Parameter
 
 import vllm._custom_ops as ops
+from vllm._aiter_ops import rocm_aiter_ops
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
@@ -23,6 +24,7 @@ class GateLinear(ReplicatedLinear):
     2. fp32 specialized kernel (SM90+ or gfx950, bf16/fp32 in, fp32 out,
        M<=32, model-specific shapes)
     3. bf16x3 CuteDSL kernel (SM100, bf16 in, fp32 weight)
+    3.5. aiter tuned GEMM (ROCm, VLLM_ROCM_USE_AITER + VLLM_ROCM_USE_AITER_LINEAR)
     4. cuBLAS bf16×bf16→fp32 (SM90+ + bf16 weight + fp32 out_dtype)
     5. F.linear via ReplicatedLinear (ultimate fallback)
 
@@ -225,6 +227,17 @@ class GateLinear(ReplicatedLinear):
 
             output = bf16x3_router_gemm(x, self.weight)
             return self._return(output)
+
+        # Tier 3.5: aiter tuned GEMM (ROCm)
+        if (
+            self._router_gemm_no_bias
+            and x.dtype == torch.bfloat16
+            and rocm_aiter_ops.is_linear_enabled()
+        ):
+            from aiter.tuned_gemm import tgemm
+
+            output = tgemm.mm(x, self.weight, otype=self.out_dtype)
+            return output, None
 
         # Tier 4: cuBLAS bf16→fp32
         if self.allow_cublas_router_gemm and x.dtype == torch.bfloat16:
