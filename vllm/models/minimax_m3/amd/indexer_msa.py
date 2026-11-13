@@ -736,11 +736,16 @@ class MiniMaxM3MSAIndexer(nn.Module):
         *,
         decode_page16_block_table: torch.Tensor | None = None,
         prefill_page16_block_table: torch.Tensor | None = None,
+        prefill_sort_topk: dict | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        # prefill_sort_topk (k4v8 Gluon attend): only the NVFP4 impl's prefill
+        # top-k emits the sort_topk; passed on only when requested.
+        extra = {} if prefill_sort_topk is None else {"prefill_sort_topk": prefill_sort_topk}
         return self.impl(
             index_query,
             decode_page16_block_table=decode_page16_block_table,
             prefill_page16_block_table=prefill_page16_block_table,
+            **extra,
         )
 
 

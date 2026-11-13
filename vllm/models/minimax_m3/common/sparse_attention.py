@@ -559,6 +559,20 @@ def select_main_backend_and_impl_cls(
             f"cache dtype, got {kv_cache_dtype}"
         )
     if use_nvfp4 and current_platform.is_rocm():
+        from vllm.models.minimax_m3.amd.sparse_attention_k4v8 import (
+            MiniMaxM3SparseRocmK4v8Backend,
+            MiniMaxM3SparseRocmK4v8Impl,
+            minimax_m3_k4v8_enabled,
+        )
+
+        if minimax_m3_k4v8_enabled():
+            # Main K/V as k4v8 (MXFP4 K + fp8 V); the index cache stays NVFP4.
+            logger.info_once(
+                "MiniMax M3 sparse attention selected ROCm k4v8 (AITER "
+                "MSA, topk_blocks=%s)",
+                topk_blocks,
+            )
+            return MiniMaxM3SparseRocmK4v8Backend, MiniMaxM3SparseRocmK4v8Impl
         from vllm.models.minimax_m3.amd.sparse_attention_nvfp4 import (
             MiniMaxM3SparseRocmNvfp4Backend,
             MiniMaxM3SparseRocmNvfp4Impl,

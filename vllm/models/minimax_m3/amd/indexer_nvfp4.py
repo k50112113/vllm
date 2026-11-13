@@ -164,8 +164,12 @@ class MiniMaxM3IndexerRocmNvfp4Impl(MiniMaxM3IndexerImpl):
     def forward(
         self,
         index_query: torch.Tensor,
+        prefill_sort_topk: dict | None = None,
         **_aiter_table_args,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """prefill_sort_topk: the k4v8 Gluon attend's prefill sort_topk request
+        (minimax_m3_k4v8_prefill_sort_topk); the prefill top-k is then AITER's
+        FlyDSL one, which also writes the sort_topk into its sort_topk_out."""
         from .ops.index_topk_decode.host import (
             minimax_m3_index_topk_decode_indices,
             minimax_m3_index_topk_prefill_indices,
@@ -253,10 +257,24 @@ class MiniMaxM3IndexerRocmNvfp4Impl(MiniMaxM3IndexerImpl):
                 max_seq_len=p.max_seq_len,
             )
             prefill_topk = buf[:, nd:num_tokens, :]
-            minimax_m3_index_topk_prefill_indices(
-                score,
-                prefill_topk,
-                max_seq_len=p.max_seq_len,
-                num_valid_pages=md.prefill_num_valid_pages,
-            )
+            if prefill_sort_topk is not None:
+                # Same top-k bit for bit, plus the attend's sort_topk.
+                from aiter.ops.flydsl.fused_m3_index_topk_prefill_indices_sort_topk import (
+                    flydsl_fused_m3_index_topk_prefill_indices_sort_topk,
+                )
+
+                flydsl_fused_m3_index_topk_prefill_indices_sort_topk(
+                    score,
+                    prefill_topk,
+                    max_seq_len=p.max_seq_len,
+                    num_valid_pages=md.prefill_num_valid_pages,
+                    **prefill_sort_topk,
+                )
+            else:
+                minimax_m3_index_topk_prefill_indices(
+                    score,
+                    prefill_topk,
+                    max_seq_len=p.max_seq_len,
+                    num_valid_pages=md.prefill_num_valid_pages,
+                )
         return decode_topk, prefill_topk

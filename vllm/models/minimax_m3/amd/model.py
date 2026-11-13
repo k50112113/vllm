@@ -131,6 +131,11 @@ from vllm.models.minimax_m3.amd.ops.sparse_pa import (
     minimax_m3_alloc_sparse_block_table,
     minimax_m3_sparse_block_page_stride,
 )
+from vllm.models.minimax_m3.amd.sparse_attention_k4v8 import (
+    minimax_m3_k4v8_enabled,
+    minimax_m3_k4v8_prefill_sort_topk,
+    minimax_m3_norm_rope_k4v8_insert,
+)
 from vllm.models.minimax_m3.amd.sparse_attention_msa import (
     MiniMaxM3SparseAiterPADecodeMetadata,
     MiniMaxM3SparseAiterPAImpl,
@@ -838,6 +843,8 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         # One fused kernel inserts both caches, so NVFP4 K/V needs an NVFP4
         # index cache.
         self.use_nvfp4_kv = get_kv_quant_mode(self.kv_cache_dtype).is_nvfp4
+        # k4v8 main K/V (MXFP4 K + fp8 V) under the NVFP4 index cache; opt-in.
+        self.use_k4v8_kv = self.use_nvfp4_kv and minimax_m3_k4v8_enabled()
         # Whether the attention can emit MXFP8 for o_proj; resolved on first use.
         self._o_proj_mxfp8: bool | None = None
         # Indexer and main attention are separate impls. This indexer is
@@ -1232,12 +1239,21 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         main_slot_mapping = fwd_slot_mapping[self.layer_name]
         if self.use_nvfp4_kv:
             assert self.indexer is not None
-            q, index_q = self._norm_rope_nvfp4_insert(
-                qkv,
-                positions,
-                main_slot_mapping,
-                fwd_slot_mapping[self.indexer.index_cache.prefix],
-            )
+            if self.use_k4v8_kv:
+                q, index_q = minimax_m3_norm_rope_k4v8_insert(
+                    self,
+                    qkv,
+                    positions,
+                    main_slot_mapping,
+                    fwd_slot_mapping[self.indexer.index_cache.prefix],
+                )
+            else:
+                q, index_q = self._norm_rope_nvfp4_insert(
+                    qkv,
+                    positions,
+                    main_slot_mapping,
+                    fwd_slot_mapping[self.indexer.index_cache.prefix],
+                )
             index_arg = None if self.skip_index_topk else index_q
             attn_output: torch.Tensor | QuantizedActivation
             if self._emits_o_proj_mxfp8():
@@ -1250,11 +1266,14 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
                 self._run_attention(
                     q, index_arg, None, out_q=out_q, out_scale=out_scale
                 )
+                # o_proj's output dtype: the activation's (q itself is MXFP8
+                # on the k4v8 Gluon path)
                 attn_output = QuantizedActivation(
-                    out_q, out_scale, q.dtype, out_q.shape, kMxfp8Dynamic
+                    out_q, out_scale, qkv.dtype, out_q.shape, kMxfp8Dynamic
                 )
             else:
-                output = torch.empty_like(q)
+                # q is MXFP8 on the k4v8 Gluon path: allocate in the activation dtype
+                output = torch.empty(q.shape, dtype=qkv.dtype, device=qkv.device)
                 attn_output = self._run_attention(q, index_arg, output)
             output, _ = self.o_proj(attn_output)
             return output
@@ -1495,6 +1514,12 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         # When skip_index_topk is set (ATOM index_topk_freq), reuse the selection
         # the preceding compute layer wrote into the shared buffer this forward.
         decode_sparse_table: tuple[torch.Tensor, torch.Tensor] | None = None
+        # k4v8 Gluon attend: the indexer's prefill top-k also emits the attend's
+        # sort_topk (a layer reusing another's top-k builds its own in msa_fwd).
+        sort_topk_req = None
+        if self.use_k4v8_kv and not self.skip_index_topk:
+            sort_topk_req = minimax_m3_k4v8_prefill_sort_topk(self)
+        idx_kw = {} if sort_topk_req is None else {"prefill_sort_topk": sort_topk_req}
         if not self.skip_index_topk:
             assert index_query is not None
             assert self.indexer is not None
@@ -1521,6 +1546,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
                     index_query,
                     decode_page16_block_table=decode_page16,
                     prefill_page16_block_table=prefill_page16,
+                    **idx_kw,
                 )
             else:
                 attn_metadata = get_forward_context().attn_metadata
@@ -1545,9 +1571,9 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
                             block_page_stride=block_page_stride,
                         )
                     else:
-                        self.indexer(index_query)
+                        self.indexer(index_query, **idx_kw)
                 else:
-                    self.indexer(index_query)
+                    self.indexer(index_query, **idx_kw)
         if out_q is not None:
             assert out_scale is not None
             self.impl.forward_decode_mxfp8(  # type: ignore[attr-defined]
@@ -1563,6 +1589,14 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
                 self.kv_cache,
                 output,
                 decode_sparse_table=decode_sparse_table,
+            )
+        if sort_topk_req is not None:
+            return self.impl.forward(  # type: ignore[call-arg]
+                self,
+                query,
+                self.kv_cache,
+                output,
+                prefill_sort_topk=sort_topk_req["sort_topk_out"],
             )
         return self.impl.forward(self, query, self.kv_cache, output)
 
